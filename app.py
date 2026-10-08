@@ -2,10 +2,11 @@
 Science Reading Twin — an adaptive English language twin for first-year BSc students (Kerala).
 
 Flow
-  1. Two diagnostic passages (100 and 200 words) place each learner on a 6-level ladder.
-  2. Unlimited personal practice afterwards: popular-science articles from every branch of
-     science, pitched at the learner's level and built around their weakest skill. Levels go
-     up and down with performance. Every question is a higher-order-thinking question.
+  1. A short reading check: exactly two diagnostic passages of about 50 words (one easier, one harder).
+  2. Unlimited personal practice afterwards on a 4-step ladder of 60 → 70 → 80 → 100-word passages,
+     each step harder in language and in its questions. Every student starts at 60 words; 80%+ moves
+     up one step, below 50% moves down one. Passages come from every branch of science and are built
+     around the learner's weakest skill. Every question is a higher-order-thinking question.
   3. Immediate feedback on every question, a full review with smileys after every passage.
   4. Students can save & quit any time and resume later. Every visit is logged.
   5. Accuracy safeguards: strict factual rules, an automatic fact-check of every new passage,
@@ -13,12 +14,16 @@ Flow
 Storage: Google Sheets (Summary, Roster, Logins, Passages, Attempts, Drafts, Bank, Flags) or local CSV.
 """
 
+import atexit
 import html
 import json
+import queue
 import random
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -82,28 +87,54 @@ CHECKER_MODEL = str(secret("CHECKER_MODEL", "gemini-3.8-flash"))
 FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash",
                    "gemini-3.8-flash"]
 
-LEVELS = [80, 100, 130, 160, 200, 250]
-LEVEL_NAMES = ["Starter", "Elementary", "Pre-Intermediate", "Intermediate", "Upper-Intermediate", "Advanced"]
+# Level 0 is the reading check (50 words). Practice uses levels 1-4: 60 → 70 → 80 → 100 words.
+LEVELS = [50, 60, 70, 80, 100]
+LEVEL_NAMES = ["Reading check", "Starter", "Elementary", "Intermediate", "Advanced"]
+PRACTICE_MIN, PRACTICE_MAX = 1, len(LEVELS) - 1
 LEVEL_STYLE = [
-    "Short, simple sentences. Present and past simple tense. Everyday words; at most one or two simple science words, each explained in the text.",
-    "Short sentences, some joined with and / but / because. Everyday words plus 2-3 science words explained by context.",
-    "Mix of simple and compound sentences. A few academic words (evidence, effect, process) made clear by context.",
-    "Some complex sentences (when, although, which, if). Moderate academic vocabulary. A clear cause-and-effect line.",
-    "Varied sentence structures, some passive voice, academic vocabulary, a few well-known approximate figures.",
-    "Well-developed paragraphs, varied complex sentences, a reflective or analytical tone that weighs evidence and uncertainty.",
+    "Short, clear sentences with everyday words.",  # reading check (each diagnostic passage sets its own style)
+    "Short, simple sentences. Present and past simple tense. Everyday words; at most one simple science word, "
+    "explained in the text. One main idea.",
+    "Short sentences, some joined with and / but / because. Everyday words plus 2 science words made clear by context. "
+    "One idea with a simple cause and effect.",
+    "A mix of simple and complex sentences (when, although, which, if). A few academic words (evidence, effect, "
+    "process) made clear by context. A clear cause-and-effect line or a comparison.",
+    "Varied sentence structures, including some passive voice and hedging (may, likely, suggests). Academic "
+    "vocabulary. Weighs a benefit against a risk, or evidence against uncertainty, so the reader must judge.",
 ]
+# How hard the questions are at each level (the passage gets harder AND the thinking gets harder).
+QUESTION_STYLE = [
+    "Questions are short and direct; options are short.",
+    "Questions are short and direct. The inference is one small step from the passage; wrong options are clearly "
+    "wrong on careful reading. The written question asks for a simple opinion with one reason.",
+    "The inference needs two pieces of information from the passage joined together. The written question asks for an "
+    "opinion with a reason and an example.",
+    "The inference needs reasoning beyond the words (cause and effect, or an unstated assumption). Distractors are "
+    "close. The written question asks the student to compare, predict or apply the idea, with reasons.",
+    "The inference needs careful judgement (strength of evidence, the writer's purpose, fact versus opinion). All "
+    "distractors are plausible. The written question asks the student to evaluate a claim or propose and justify a "
+    "solution.",
+]
+GLOSSARY_SIZE = [3, 3, 3, 4, 5]
 
-# Two diagnostic passages: one easy-to-middle, one middle-to-hard. Placement uses both scores.
+# Exactly two diagnostic passages, both about 50 words: one easier, one harder. They show the learner's
+# strengths and weaknesses; practice then starts at 60 words for everyone.
 DIAGNOSTIC_PLAN = [
-    {"level": 1, "label": "Everyday science",
+    {"level": 0, "label": "Everyday science",
      "brief": "the science behind something students see every day (rain and clouds, cooking, a smartphone, sleep, "
-              "plants in a garden, a rainbow, mosquitoes, ripening fruit)"},
-    {"level": 4, "label": "Science and society",
+              "plants in a garden, a rainbow, mosquitoes, ripening fruit)",
+     "style": "Easier: short, simple sentences, everyday words, at most one science word explained in the text.",
+     "q_style": QUESTION_STYLE[1]},
+    {"level": 0, "label": "Science and society",
      "brief": "a science or technology topic that affects society and invites judgement (plastic pollution, vaccines "
               "and public health, artificial intelligence, renewable energy, antibiotic resistance, space exploration, "
-              "loss of biodiversity)"},
+              "loss of biodiversity)",
+     "style": "Harder: some complex sentences, two or three academic words made clear by context, and a point of view "
+              "or a trade-off the reader must weigh.",
+     "q_style": QUESTION_STYLE[3]},
 ]
 N_DIAG = len(DIAGNOSTIC_PLAN)
+VERSION_TAG = "v2-"  # passages and bank rows made for this 50/60/70/80/100 ladder
 
 # Branches of science used in rotation for practice passages.
 PRACTICE_TOPICS = [
@@ -275,8 +306,17 @@ class LocalStore:
         self.folder.mkdir(exist_ok=True)
 
     def append(self, table, row):
+        self.append_rows(table, [row])
+
+    def append_rows(self, table, rows):
         path = self.folder / f"{table}.csv"
-        pd.DataFrame([row])[TABLES[table]].to_csv(path, mode="a", header=not path.exists(), index=False)
+        df = pd.DataFrame(rows).reindex(columns=TABLES[table]).fillna("")
+        df.to_csv(path, mode="a", header=not path.exists(), index=False)
+
+    def last_row(self, table, col, value):
+        df = self.read(table)
+        df = df[df[col] == str(value)]
+        return None if df.empty else df.iloc[-1].to_dict()
 
     def read(self, table):
         path = self.folder / f"{table}.csv"
@@ -318,13 +358,34 @@ class SheetStore:
             self._ws[table] = ws
         return self._ws[table]
 
-    def append(self, table, row):
+    @staticmethod
+    def _cells(table, row):
         cells = []
         for c in TABLES[table]:
             v = row.get(c, "")
             # numbers stay numbers (so Sheets can average them); everything else is plain text
             cells.append(v if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)[:45000])
-        _retry(lambda: self._sheet(table).append_row(cells, value_input_option="RAW"))
+        return cells
+
+    def append(self, table, row):
+        self.append_rows(table, [row])
+
+    def append_rows(self, table, rows):
+        """Many rows in ONE request — keeps the class well under Google's per-minute limit."""
+        cells = [self._cells(table, r) for r in rows]
+        _retry(lambda: self._sheet(table).append_rows(cells, value_input_option="RAW"))
+
+    def last_row(self, table, col, value):
+        """The last row whose `col` equals `value`, reading only that column + one row (fast, tiny)."""
+        ws = self._sheet(table)
+        idx = TABLES[table].index(col) + 1
+        values = _retry(lambda: ws.col_values(idx))
+        hits = [i for i, v in enumerate(values, start=1) if i > 1 and str(v).strip() == str(value)]
+        if not hits:
+            return None
+        row = _retry(lambda: ws.row_values(hits[-1]))
+        row += [""] * (len(TABLES[table]) - len(row))
+        return dict(zip(TABLES[table], row))
 
     def read(self, table):
         records = self._sheet(table).get_all_records(numericise_ignore=["all"])
@@ -492,21 +553,131 @@ def clear_cache():
     get_roster.clear()
 
 
-def write_row(table, row):
-    """Save a row; if Sheets is unreachable, keep it queued and retry on the next save."""
-    queue = st.session_state.setdefault("unsaved", [])
-    queue.append((table, row))
+# Tables whose cached copy must be re-read after a write. Logins / Attempts / Drafts are only read by the
+# teacher (who has a Refresh button), so writing them never forces everybody to re-download them.
+REFRESH_AFTER_WRITE = {"Passages", "Bank", "Flags"}
+
+
+class Writer:
+    """Saves rows to Google Sheets in the background, in batches.
+
+    Students never wait for Google: a click only drops the row into a queue. Every couple of seconds one
+    request per table writes everything waiting, so a whole class stays far below Google's limit of about
+    60 requests a minute. If Google is busy, rows stay queued and are retried — nothing is lost."""
+
+    def __init__(self, store, versions):
+        self.store, self.versions = store, versions
+        self.q = queue.Queue()
+        self.backlog = []
+        self.last_error = ""
+        self.failures = 0
+        threading.Thread(target=self._run, daemon=True, name="sheet-writer").start()
+        atexit.register(self.flush, 15.0)  # on restart/shutdown, finish saving what is queued
+
+    def put(self, table, row):
+        self.q.put((table, row))
+
+    def pending(self):
+        return self.q.qsize() + len(self.backlog)
+
+    def flush(self, timeout=8.0):
+        end = time.time() + timeout
+        while self.pending() and time.time() < end:
+            time.sleep(0.2)
+
+    def _run(self):
+        while True:
+            try:
+                self.backlog.append(self.q.get(timeout=None if not self.backlog else 2.0))
+            except queue.Empty:
+                pass
+            time.sleep(1.5)  # gather what else arrives, so it goes in the same request
+            while True:
+                try:
+                    self.backlog.append(self.q.get_nowait())
+                except queue.Empty:
+                    break
+            groups = {}
+            for t, r in self.backlog:
+                groups.setdefault(t, []).append(r)
+            failed = []
+            for t, rows in groups.items():
+                try:
+                    self.store.append_rows(t, rows)
+                    if t in REFRESH_AFTER_WRITE:
+                        self.versions[t] = self.versions.get(t, 0) + 1
+                except Exception as e:
+                    failed += [(t, r) for r in rows]
+                    self.last_error = f"{t}: {str(e)[:150]}"
+            self.backlog = failed
+            self.failures = self.failures + 1 if failed else 0
+            if failed:
+                time.sleep(min(60, 5 * self.failures))
+
+
+@st.cache_resource(show_spinner=False)
+def _writer(_store, store_key):
+    return Writer(_store, _versions())
+
+
+def get_writer():
     store = get_store()[0]
-    remaining = []
-    for t, r in queue:
-        try:
-            store.append(t, r)
-        except Exception as e:
-            remaining.append((t, r))
-            st.toast(f"Couldn't save to {t} yet — will retry. ({str(e)[:80]})", icon="⚠️")
-    st.session_state.unsaved = remaining
-    v = _versions()
-    v[table] = v.get(table, 0) + 1  # only this table is re-read next time
+    return _writer(store, id(store))
+
+
+def write_row(table, row):
+    """Queue a row for saving; returns at once (see Writer)."""
+    get_writer().put(table, row)
+
+
+class BankMirror:
+    """The passage bank kept in memory, so picking a passage takes milliseconds instead of downloading
+    the whole Bank tab. New passages are added here first, then saved to the Sheet in the background."""
+
+    def __init__(self):
+        self.rows = {}
+        self.loaded = False
+        self.lock = threading.Lock()
+
+    def add(self, row):
+        with self.lock:
+            self.rows[row["bank_id"]] = row
+
+    def ensure_loaded(self):
+        if self.loaded:
+            return
+        with self.lock:
+            if self.loaded:
+                return
+            try:
+                df = _retry(lambda: get_store()[0].read("Bank"))
+            except Exception:
+                return  # try again next time; passages made meanwhile are still in self.rows
+            for r in df.to_dict("records"):
+                if str(r.get("bank_id", "")).startswith(VERSION_TAG):
+                    self.rows.setdefault(r["bank_id"], r)
+            self.loaded = True
+
+    def all(self):
+        with self.lock:
+            return list(self.rows.values())
+
+    def get(self, bank_id):
+        with self.lock:
+            return self.rows.get(bank_id)
+
+
+@st.cache_resource(show_spinner=False)
+def get_bank():
+    return BankMirror()
+
+
+@st.cache_resource(show_spinner=False)
+def get_jobs():
+    """Background passage writers: 2 for students' next passages, 1 for the teacher's 'fill the bank'."""
+    return {"student": ThreadPoolExecutor(2, thread_name_prefix="prefetch"),
+            "teacher": ThreadPoolExecutor(1, thread_name_prefix="fill"),
+            "inflight": set(), "lock": threading.Lock(), "fill_left": [0]}
 
 
 def log_event(event, detail=""):
@@ -515,22 +686,36 @@ def log_event(event, detail=""):
 
 
 def save_draft(cur, state=None):
-    """Keep the unfinished passage so the student can quit and resume later."""
+    """Keep the unfinished passage so the student can quit and resume later.
+    The passage itself lives in the bank, so the draft only stores its bank_id and the answers (small rows)."""
+    if state is None:
+        light = {k: v for k, v in cur.items() if k != "pack" or not cur.get("bank_id")}
+        if cur.get("bank_id"):  # keep the student's own (shuffled) option order
+            light["mcqs"] = {k: cur["pack"][k] for k in ("q_analyse", "q_vocab")}
+        state = json.dumps(light, ensure_ascii=False)
     write_row("Drafts", {"timestamp": now(), "roll": st.session_state.roll, "passage_id": cur["id"],
-                         "state": json.dumps(cur, ensure_ascii=False) if state is None else state})
+                         "state": state})
 
 
-def pending_draft(roll):
-    d = read_table("Drafts")
-    d = d[d["roll"] == str(roll)]
-    if d.empty or not d.iloc[-1]["state"].strip():
-        return None
-    p = read_table("Passages")
-    done = set(p[p["roll"] == str(roll)]["passage_id"])
-    if d.iloc[-1]["passage_id"] in done:
-        return None
+def pending_draft(roll, done_ids):
     try:
-        cur = json.loads(d.iloc[-1]["state"])
+        last = get_store()[0].last_row("Drafts", "roll", roll)
+    except Exception:
+        return None
+    if not last or not str(last.get("state", "")).strip() or last.get("passage_id") in done_ids:
+        return None
+    if not str(last.get("passage_id", "")).startswith(VERSION_TAG):
+        return None  # unfinished passage from the old 80–250-word ladder: start fresh instead
+    try:
+        cur = json.loads(last["state"])
+        if "pack" not in cur:
+            bank = get_bank()
+            bank.ensure_loaded()
+            row = bank.get(cur.get("bank_id"))
+            if row is None:
+                return None
+            cur["pack"] = json.loads(row["pack"]) if isinstance(row["pack"], str) else dict(row["pack"])
+            cur["pack"].update(cur.pop("mcqs", {}))
         cur["results"] = {int(k): v for k, v in cur["results"].items()}
         cur["started"] = time.time()
         return cur
@@ -627,21 +812,28 @@ def model_cooldowns():
     return {}  # model -> time it hit its limit (shared by all students)
 
 
-def ask_gemini(prompt, schema, temperature=0.7, model=None):
-    """Structured JSON call. Tries each free model in turn; a model that hit its limit is skipped for a minute."""
-    client = get_client()
+def gemini_ctx():
+    """(client, cooldowns) — fetched on the main thread and handed to background threads."""
+    return get_client(), model_cooldowns()
+
+
+def ask_gemini(prompt, schema, temperature=0.7, model=None, ctx=None, deadline=None):
+    """Structured JSON call. Tries each free model in turn; a model that hit its limit is skipped for a minute.
+    `deadline` (a time.time() value) stops trying so a student is never kept waiting for minutes."""
+    client, cool = ctx or gemini_ctx()
     if client is None:
         raise RuntimeError("Gemini API key missing — add GEMINI_API_KEY to your secrets.")
     from google.genai import types
 
     config = types.GenerateContentConfig(
         response_mime_type="application/json", response_schema=schema, temperature=temperature)
-    cool = model_cooldowns()
     last, busy = None, True
     for model in dict.fromkeys([model or GEMINI_MODEL, GEMINI_MODEL] + FALLBACK_MODELS):
         if time.time() - cool.get(model, 0) < 60:
             continue
         for attempt in range(2):
+            if deadline and time.time() > deadline:
+                raise GeminiBusy("Gemini is slow right now.")
             try:
                 resp = client.models.generate_content(model=model, contents=prompt, config=config)
                 if isinstance(resp.parsed, schema):
@@ -659,7 +851,7 @@ def ask_gemini(prompt, schema, temperature=0.7, model=None):
                     break
                 if not ("503" in m or "UNAVAILABLE" in m or "overloaded" in m.lower()):
                     busy = False
-                time.sleep(1.5)
+                time.sleep(1.0)
     if last is None or busy:
         raise GeminiBusy(friendly(last) if last else "All Gemini models are at their limit right now.")
     raise RuntimeError(friendly(last))
@@ -684,13 +876,15 @@ ACCURACY_RULES = (
 
 def passage_prompt(words, level_idx, topic, focus, avoid_titles, issues, variety):
     ct = random.sample(CT_SKILLS, 2)
+    style = topic.get("style") or LEVEL_STYLE[level_idx]
+    q_style = topic.get("q_style") or QUESTION_STYLE[level_idx]
     lines = [
         "You write English reading-comprehension material for first-year BSc students in Kerala, India. Many "
         "studied in Malayalam-medium schools. The goal is English language skills and critical thinking, NOT "
         "teaching science content.",
         f"Write ONE original popular-science article of about {words} words (between {int(words * 0.9)} and "
-        f"{int(words * 1.1)} words).",
-        f"Difficulty: {LEVEL_NAMES[level_idx]}. {LEVEL_STYLE[level_idx]}",
+        f"{int(words * 1.1)} words). It is short, so keep to ONE clear idea and count your words.",
+        f"Difficulty: {LEVEL_NAMES[level_idx]}. {style}",
         f"Branch of science: {topic['label']} — {topic['brief']}.",
         f"Write it as {variety['format']}, with this angle: {variety['angle']}. Where it fits naturally, connect it "
         f"to {variety['place']}.",
@@ -713,10 +907,11 @@ def passage_prompt(words, level_idx, topic, focus, avoid_titles, issues, variety
         "ALL QUESTIONS MUST TEST HIGHER-ORDER THINKING (Bloom's analyse, evaluate, create), pitched at this level. "
         "A student must NOT be able to answer any question by copying or matching a single sentence of the passage. "
         "Questions test reading and reasoning about THIS passage, never outside science knowledge.",
+        f"QUESTION DIFFICULTY for this level: {q_style}",
         "Produce:",
         "- title: a short, engaging title.",
-        "- glossary: 4-5 words or phrases FROM the passage that may be difficult, each with a simple English meaning "
-        "(English only) and a short new everyday example sentence.",
+        f"- glossary: {GLOSSARY_SIZE[level_idx]} words or phrases FROM the passage that may be difficult, each with a "
+        "simple English meaning (English only) and a short new everyday example sentence.",
         "- grammar_tip: one short grammar or style point useful for writing about science (e.g. passive voice, "
         "cause-effect linkers, hedging words like 'may' and 'likely'), with an example sentence from the passage.",
         f"- q_analyse: a multiple-choice question testing {ct[0]}. The correct option must be worded differently "
@@ -795,49 +990,49 @@ Use simple English throughout."""
 
 # ───────────────────────────── learner progress ─────────────────────────────
 def load_progress(roll):
+    """Read this student's history ONCE at login; after that progress is updated in memory."""
     df = read_table("Passages")
-    df = df[df["roll"] == str(roll)].reset_index(drop=True)
+    st.session_state.my_rows = df[df["roll"] == str(roll)].to_dict("records")
+    try:
+        logins = read_table("Logins")
+        st.session_state.visits = int(((logins["roll"] == str(roll)) & (logins["event"] == "login")).sum())
+    except Exception:
+        st.session_state.visits = 0
+    return compute_progress()
+
+
+def is_new_ladder(row):
+    return str(row.get("passage_id", "")).startswith(VERSION_TAG)
+
+
+def compute_progress():
+    """Where the student is now, worked out from their own rows (no Google Sheets call)."""
+    rows = st.session_state.get("my_rows", [])
+    df = pd.DataFrame(rows, columns=PASSAGE_COLS).fillna("").astype(str)
     recent = df.tail(6)
     skills = {k: (recent[k].map(num).mean() if not recent.empty else None) for k in SKILLS}
     issues = [i for i in df["language_issues"].tail(3) if i.strip()]
-    logins = read_table("Logins")
-    visits = int(((logins["roll"] == str(roll)) & (logins["event"] == "login")).sum())
 
     diag = df[df["phase"] == "Diagnostic"]
     done = sorted({int(num(s)) for s in diag["stage"]} & set(range(N_DIAG)))
     base = dict(skills=skills, issues="; ".join(issues), titles=df["title"].tolist(), n_done=len(df),
-                avg=df["passage_score"].map(num).mean() if len(df) else None, visits=visits, diag_done=len(done))
+                avg=df["passage_score"].map(num).mean() if len(df) else None,
+                visits=st.session_state.get("visits", 0), diag_done=len(done),
+                done_ids=set(df["passage_id"]))
     if len(done) < N_DIAG:
         stage = next(i for i in range(N_DIAG) if i not in done)
         return {**base, "phase": "Diagnostic", "stage": stage, "level_idx": DIAGNOSTIC_PLAN[stage]["level"],
                 "focus": None}
 
     practice = df[df["phase"] == "Practice"]
-    if practice.empty:
-        level = placement_level(diag)
+    ladder = [r for r in practice.to_dict("records") if is_new_ladder(r)]
+    if ladder:
+        level = int(num(ladder[-1]["next_level_idx"], PRACTICE_MIN))
     else:
-        level = int(num(practice.iloc[-1]["next_level_idx"]))
+        level = PRACTICE_MIN  # after the reading check everyone starts at 60 words
+    level = min(max(level, PRACTICE_MIN), PRACTICE_MAX)
     focus = min(SKILLS, key=lambda k: skills[k] if skills[k] is not None and not pd.isna(skills[k]) else 101)
     return {**base, "phase": "Practice", "stage": len(practice), "level_idx": level, "focus": focus}
-
-
-def placement_level(diag):
-    """Starting level from the two diagnostic passages (latest attempt of each)."""
-    score = {}
-    for r in diag.itertuples():
-        score[int(num(r.stage))] = num(r.passage_score)
-    d1, d2 = score.get(0, 0), score.get(1, 0)
-    if d2 >= 85:
-        return 5
-    if d2 >= 70:
-        return 4
-    if d2 >= 50:
-        return 3
-    if d1 >= 70:
-        return 2
-    if d1 >= 50:
-        return 1
-    return 0
 
 
 def shuffle_mcq(q):
@@ -867,36 +1062,41 @@ def has_invented_source(pack):
     return bool(SOURCE_RE.search(pack.title + " " + pack.passage + " " + pack.model_answer))
 
 
-def fact_check(pack):
+def fact_check(pack, ctx=None, deadline=None):
     """Second opinion from a stronger model. Returns ('pass'|'fail'|'unchecked', problems)."""
     try:
-        res = ask_gemini(factcheck_prompt(pack.model_dump()), FactCheck, temperature=0.1, model=CHECKER_MODEL)
+        res = ask_gemini(factcheck_prompt(pack.model_dump()), FactCheck, temperature=0.1, model=CHECKER_MODEL,
+                         ctx=ctx, deadline=deadline)
     except Exception:
         return "unchecked", []
     ok = res.verdict.strip().lower() == "pass" and not res.problems
     return ("pass" if ok else "fail"), res.problems
 
 
-def generate_pack(level_idx, topic, focus, titles, issues):
-    """Write a passage, reject rule-breakers, fact-check it. Returns (pack_dict, fact_check_status)."""
+def generate_pack(level_idx, topic, focus, titles, issues, ctx=None, deadline=None, tries=3):
+    """Write a passage, reject rule-breakers, fact-check it. Returns (pack_dict, fact_check_status).
+    Uses no Streamlit calls, so it can run in a background thread."""
     words = LEVELS[level_idx]
     last_problems = []
-    for attempt in range(3):
+    for attempt in range(tries):
+        if deadline and time.time() > deadline:
+            break
         variety = pick_variety()
         prompt = passage_prompt(words, level_idx, topic, focus, titles, issues, variety)
         if last_problems:
             prompt += ("\n\nAn earlier draft was rejected by the science editor for: " + "; ".join(last_problems[:4])
                        + ". Write a completely new article that avoids these problems.")
-        pack = ask_gemini(prompt, PassagePack, temperature=0.9)
+        pack = ask_gemini(prompt, PassagePack, temperature=0.9, ctx=ctx, deadline=deadline)
         if has_caste_marker(pack) or has_invented_source(pack):
             last_problems = ["mentioning an invented study, expert, date or source"]
             continue
         gap = abs(wc(pack.passage) - words) / words
-        if gap > 0.3 and attempt < 2:
+        if gap > 0.3 and attempt < tries - 1:
+            last_problems = [f"the article was {wc(pack.passage)} words but must be about {words} words"]
             continue
         if len(pack.q_analyse.options) < 3 or len(pack.q_vocab.options) < 3:
             continue
-        status, problems = fact_check(pack)
+        status, problems = fact_check(pack, ctx=ctx, deadline=deadline)
         if status == "fail":
             last_problems = problems
             continue
@@ -904,84 +1104,172 @@ def generate_pack(level_idx, topic, focus, titles, issues):
     raise RuntimeError("Couldn't create an accurate passage this time — please click the button again.")
 
 
-def save_to_bank(pack, phase, stage, level_idx, topic, focus, status):
-    write_row("Bank", {"timestamp": now(), "bank_id": uuid.uuid4().hex[:10], "phase": phase, "stage": stage,
-                       "level_idx": level_idx, "words": LEVELS[level_idx], "topic": topic, "focus": focus or "",
-                       "title": pack["title"], "fact_check": status, "pack": json.dumps(pack, ensure_ascii=False)})
+def bank_row(pack, phase, stage, level_idx, topic, focus, status):
+    return {"timestamp": now(), "bank_id": VERSION_TAG + uuid.uuid4().hex[:10], "phase": phase, "stage": stage,
+            "level_idx": level_idx, "words": LEVELS[level_idx], "topic": topic, "focus": focus or "",
+            "title": pack["title"], "fact_check": status, "pack": json.dumps(pack, ensure_ascii=False)}
+
+
+def save_to_bank(row, bank=None, writer=None):
+    """Add to the in-memory bank at once (usable immediately) and queue the Sheet write."""
+    (bank or get_bank()).add(row)
+    (writer or get_writer()).put("Bank", row)
+    return row["bank_id"]
 
 
 def flagged_titles():
-    return set(read_table("Flags")["title"])
+    try:
+        return set(read_table("Flags")["title"])
+    except Exception:
+        return set()
 
 
-def seen_titles(roll):
-    p, d = read_table("Passages"), read_table("Drafts")
-    seen = set(p[p["roll"] == str(roll)]["title"])
-    for state in d[d["roll"] == str(roll)]["state"]:
+def seen_titles(prog):
+    """Titles this student has already had (finished, started or served this session)."""
+    return set(prog["titles"]) | st.session_state.setdefault("served", set())
+
+
+def bank_candidates(phase, stage, level_idx, exclude):
+    """Fact-checked bank rows this student hasn't seen, for one phase/level (diagnostic: one stage)."""
+    out = []
+    for r in get_bank().all():
+        if r.get("fact_check") != "pass" or r.get("title") in exclude or r.get("phase") != phase:
+            continue
+        if int(num(r.get("level_idx"), -1)) != level_idx:
+            continue
+        if phase == "Diagnostic" and int(num(r.get("stage"), -1)) != stage:
+            continue
+        out.append(r)
+    return out
+
+
+def from_bank(prog, exclude, nearest=False):
+    """A stored passage this student hasn't seen — same level (preferring their focus skill).
+    With nearest=True, the closest level is accepted too (used only when Gemini is busy)."""
+    level, phase, stage = prog["level_idx"], prog["phase"], prog["stage"]
+    pools = [bank_candidates(phase, stage, level, exclude)]
+    if nearest:
+        if phase == "Diagnostic":
+            pools.append(bank_candidates(phase, 1 - stage, level, exclude))
+        else:
+            for d in (1, -1, 2, -2, 3, -3):
+                if PRACTICE_MIN <= level + d <= PRACTICE_MAX:
+                    pools.append(bank_candidates(phase, stage, level + d, exclude))
+    for pool in pools:
+        if not pool:
+            continue
+        mine = [r for r in pool if prog.get("focus") and r.get("focus") == prog["focus"]]
+        row = random.choice(mine or pool)
         try:
-            seen.add(json.loads(state)["pack"]["title"])
+            pack = json.loads(row["pack"]) if isinstance(row["pack"], str) else dict(row["pack"])
+            return pack, row
         except Exception:
-            pass
-    return seen
-
-
-def from_bank(prog, roll):
-    """Pick a stored passage this student hasn't seen: same level (and same topic if possible)."""
-    bank = read_table("Bank")
-    if bank.empty:
-        return None
-    bank = bank[(bank["fact_check"] == "pass") & ~bank["title"].isin(seen_titles(roll) | flagged_titles())].copy()
-    if bank.empty:
-        return None
-    bank["lvl"] = bank["level_idx"].map(num)
-    level = prog["level_idx"]
-    same_level = bank[bank["lvl"] == level]
-    if prog["phase"] == "Diagnostic":
-        best = same_level[(same_level["phase"] == "Diagnostic") & (same_level["stage"].map(num) == prog["stage"])]
-    else:
-        best = same_level[same_level["phase"] == "Practice"]
-    for pool in (best, same_level, bank.loc[(bank["lvl"] - level).abs().sort_values().index[:10]]):
-        if not pool.empty:
-            row = pool.sample(1).iloc[0]
-            try:
-                return json.loads(row["pack"]), row
-            except Exception:
-                continue
+            continue
     return None
 
 
-def new_passage(prog):
-    level_idx = prog["level_idx"]
+def topic_for(prog, roll):
     if prog["phase"] == "Diagnostic":
-        topic, focus = DIAGNOSTIC_PLAN[prog["stage"]], None
-    else:
-        offset = sum(map(ord, str(st.session_state.roll)))  # each student starts at a different branch
-        topic, focus = PRACTICE_TOPICS[(prog["stage"] + offset) % len(PRACTICE_TOPICS)], prog["focus"]
-    source = "fresh"
+        return DIAGNOSTIC_PLAN[prog["stage"]]
+    offset = sum(map(ord, str(roll)))  # each student starts at a different branch
+    return PRACTICE_TOPICS[(prog["stage"] + offset) % len(PRACTICE_TOPICS)]
+
+
+def _background_make(job, ctx, bank, writer, jobs):
+    """Runs in a background thread: write + fact-check one passage and put it in the bank."""
+    key = job["key"]
     try:
-        data, status = generate_pack(level_idx, topic, focus, prog["titles"], prog["issues"])
-        save_to_bank(data, prog["phase"], prog["stage"], level_idx, topic["label"], focus, status)
-    except Exception as e:
-        if "API key" in str(e):
-            raise
-        found = from_bank(prog, st.session_state.roll)
-        if found is None:
-            raise GeminiBusy("Twin is very busy right now and the passage bank has nothing new for you yet. "
-                             "Please wait a minute and click the button again. 🙏")
+        pack, status = generate_pack(job["level"], job["topic"], job["focus"], job["titles"], "", ctx=ctx)
+        save_to_bank(bank_row(pack, job["phase"], job["stage"], job["level"], job["topic"]["label"], job["focus"],
+                              status), bank, writer)
+    except Exception:
+        pass
+    finally:
+        with jobs["lock"]:
+            jobs["inflight"].discard(key)
+
+
+def likely_next(prog, after_serving=False):
+    """The passages this student will probably need next (so they can be written in advance)."""
+    if prog["phase"] == "Diagnostic":
+        nxt = [] if after_serving else [dict(prog)]
+        if prog["stage"] + 1 < N_DIAG:
+            nxt.append({**prog, "stage": prog["stage"] + 1, "level_idx": DIAGNOSTIC_PLAN[prog["stage"] + 1]["level"]})
+        else:
+            nxt.append({**prog, "phase": "Practice", "stage": 0, "level_idx": PRACTICE_MIN})
+        return nxt
+    lvl = prog["level_idx"]
+    return [dict(prog)] + ([{**prog, "level_idx": lvl + 1, "stage": prog["stage"] + 1}] if lvl < PRACTICE_MAX else [])
+
+
+def prefetch(prog, after_serving=False):
+    """Make sure the bank already holds an unseen passage for this student's next step(s).
+    Missing ones are written in the background while the student reads — so 'Get my passage' is instant."""
+    if get_client() is None:
+        return
+    bank, jobs = get_bank(), get_jobs()
+    bank.ensure_loaded()
+    exclude = seen_titles(prog) | flagged_titles()
+    ctx, writer = gemini_ctx(), get_writer()
+    for p in likely_next(prog, after_serving):
+        if p["phase"] == "Diagnostic" and p["stage"] >= N_DIAG:
+            continue
+        if bank_candidates(p["phase"], p["stage"], p["level_idx"], exclude):  # one ready is enough
+            continue
+        key = (p["phase"], p["stage"] if p["phase"] == "Diagnostic" else 0, p["level_idx"], p.get("focus"))
+        with jobs["lock"]:
+            if key in jobs["inflight"] or len(jobs["inflight"]) >= 6:
+                continue
+            jobs["inflight"].add(key)
+        job = {"key": key, "phase": p["phase"], "stage": p["stage"] if p["phase"] == "Diagnostic" else 0,
+               "level": p["level_idx"], "topic": topic_for(p, st.session_state.roll), "focus": p.get("focus"),
+               "titles": sorted(exclude)[-12:]}
+        jobs["student"].submit(_background_make, job, ctx, bank, writer, jobs)
+
+
+def new_passage(prog):
+    """Fastest route first: an unseen fact-checked passage from the bank (instant). Only if there is none,
+    write a fresh one (with a time limit); if Gemini is slow, fall back to the nearest level in the bank."""
+    roll = st.session_state.roll
+    bank = get_bank()
+    bank.ensure_loaded()
+    exclude = seen_titles(prog) | flagged_titles()
+    topic, focus = topic_for(prog, roll), prog["focus"]
+    level_idx = prog["level_idx"]
+
+    found, source, bank_id = from_bank(prog, exclude), "bank", None
+    if found is None:
+        try:
+            data, status = generate_pack(level_idx, topic, focus, prog["titles"], prog["issues"],
+                                         deadline=time.time() + 45, tries=2)
+            bank_id = save_to_bank(bank_row(data, prog["phase"], prog["stage"], level_idx, topic["label"], focus,
+                                            status))
+            source = "fresh"
+        except Exception as e:
+            if "API key" in str(e):
+                raise
+            found = from_bank(prog, exclude, nearest=True)
+            if found is None:
+                raise GeminiBusy("Twin is very busy right now and the passage bank has nothing new for you yet. "
+                                 "Please wait a minute and click the button again. 🙏")
+    label = topic["label"]
+    if found is not None:
         data, row = found
-        level_idx = int(num(row["level_idx"], level_idx))
-        source = "bank"
+        level_idx, bank_id = int(num(row["level_idx"], level_idx)), row["bank_id"]
+        label = row.get("topic") or label
+    st.session_state.setdefault("served", set()).add(data["title"])
     data["q_analyse"], data["q_vocab"] = shuffle_mcq(data["q_analyse"]), shuffle_mcq(data["q_vocab"])
-    return {"id": uuid.uuid4().hex[:10], "pack": data, "phase": prog["phase"], "stage": prog["stage"],
-            "attempt": 1, "level_idx": level_idx, "words": LEVELS[level_idx], "topic": topic["label"],
-            "focus": focus, "source": source, "q": 0, "results": {}, "saved": False, "started": time.time()}
+    return {"id": VERSION_TAG + uuid.uuid4().hex[:10], "pack": data, "phase": prog["phase"], "stage": prog["stage"],
+            "attempt": 1, "level_idx": level_idx, "words": LEVELS[level_idx], "topic": label,
+            "focus": focus, "source": source, "bank_id": bank_id, "q": 0, "results": {}, "saved": False,
+            "started": time.time()}
 
 
 def retry_passage(cur):
     pack = dict(cur["pack"])
     pack["q_analyse"], pack["q_vocab"] = shuffle_mcq(pack["q_analyse"]), shuffle_mcq(pack["q_vocab"])
-    return {**{k: cur[k] for k in ("phase", "stage", "level_idx", "words", "topic", "focus")},
-            "id": uuid.uuid4().hex[:10], "pack": pack, "attempt": cur.get("attempt", 1) + 1,
+    return {**{k: cur.get(k) for k in ("phase", "stage", "level_idx", "words", "topic", "focus", "bank_id", "source")},
+            "id": VERSION_TAG + uuid.uuid4().hex[:10], "pack": pack, "attempt": cur.get("attempt", 1) + 1,
             "q": 0, "results": {}, "saved": False, "started": time.time()}
 
 
@@ -1003,18 +1291,20 @@ def finalize_passage(cur):
                     "evaluation": r[2]["thinking"] * 10, "writing": r[2]["language"] * 10}
     score = round(sum(r[i]["score"] for i in range(3)) / 3)
     level = cur["level_idx"]
-    if cur["phase"] == "Practice":
-        nxt = min(level + 1, len(LEVELS) - 1) if score >= 80 else max(level - 1, 0) if score < 50 else level
+    if cur["phase"] == "Practice":  # 80%+ → one step up, below 50% → one step down (never below 60 words)
+        nxt = min(level + 1, PRACTICE_MAX) if score >= 80 else max(level - 1, PRACTICE_MIN) if score < 50 else level
     else:
         nxt = level
-    write_row("Passages", {
+    row = {
         "timestamp": now(), "roll": st.session_state.roll, "name": st.session_state.name,
         "passage_id": cur["id"], "phase": cur["phase"], "stage": cur["stage"], "attempt": cur.get("attempt", 1),
         "level_idx": level, "words": cur["words"], "actual_words": wc(cur["pack"]["passage"]),
         "topic": cur["topic"], "focus": cur["focus"] or "", "title": cur["pack"]["title"], "passage_score": score,
         **skill_scores, "next_level_idx": nxt, "language_issues": r[2].get("rules", ""),
         "duration_min": round((time.time() - cur["started"]) / 60, 1), "passage": cur["pack"]["passage"],
-    })
+    }
+    write_row("Passages", row)
+    st.session_state.setdefault("my_rows", []).append({k: str(v) for k, v in row.items()})
     st.session_state.visit_done = st.session_state.get("visit_done", 0) + 1
     cur.update(saved=True, score=score, skill_scores=skill_scores, next_level=nxt)
     if score >= 85 or nxt > level:
@@ -1119,12 +1409,15 @@ def render_question(cur, i):
 
     if kind == "mcq":
         q = pack[key]
-        choice = st.radio(md(q["question"]), range(len(q["options"])), index=None, key=f"r_{wid}",
-                          format_func=lambda j: md(q["options"][j]), disabled=res is not None)
         if res is None:
             with st.expander("💡 Need a hint?"):
                 st.write(md(q["hint"]))
-            if st.button("Check answer ✅", key=f"b_{wid}", type="primary"):
+            # A form: picking an option doesn't reload the page — only "Check answer" does.
+            with st.form(f"f_{wid}", border=False):
+                choice = st.radio(md(q["question"]), range(len(q["options"])), index=None, key=f"r_{wid}",
+                                  format_func=lambda j: md(q["options"][j]))
+                sent = st.form_submit_button("Check answer ✅", type="primary")
+            if sent:
                 if choice is None:
                     st.warning("Choose an option first.")
                     return
@@ -1135,23 +1428,28 @@ def render_question(cur, i):
                 save_draft(cur)
                 st.rerun()
         else:
+            picked = q["options"].index(res["response"]) if res.get("response") in q["options"] else None
+            st.radio(md(q["question"]), range(len(q["options"])), index=picked, key=f"r_{wid}_done",
+                     format_func=lambda j: md(q["options"][j]), disabled=True)
             show_mcq_feedback(q, res)
     else:
         st.markdown(f"**{md(pack['q_written'])}**")
         st.caption("There's no single right answer — show your thinking and use the passage to support it.")
-        ans = st.text_area("Write 3–4 sentences in your own words:", key=f"t_{wid}", height=140,
-                           disabled=res is not None)
         if res is None:
             with st.expander("💡 Need help starting?"):
                 st.write(md(pack["written_hint"]))
-            if st.button("Submit answer 🚀", key=f"b_{wid}", type="primary"):
+            # A form: typing never reloads the page; the answer is sent once, on Submit.
+            with st.form(f"f_{wid}", border=False):
+                ans = st.text_area("Write 3–4 sentences in your own words:", key=f"t_{wid}", height=140)
+                sent = st.form_submit_button("Submit answer 🚀", type="primary")
+            if sent:
                 if wc(ans) < 5:
                     st.warning("Please write at least one full sentence that explains your thinking.")
                     return
                 with st.spinner(f"{TWIN} Twin is reading your answer..."):
                     offline = False
                     try:
-                        fb = ask_gemini(scoring_prompt(cur, ans), WrittenFeedback, 0.4)
+                        fb = ask_gemini(scoring_prompt(cur, ans), WrittenFeedback, 0.4, deadline=time.time() + 40)
                     except Exception as e:
                         if "API key" in str(e):
                             st.error(str(e))
@@ -1170,6 +1468,8 @@ def render_question(cur, i):
                 cur["results"][i] = res
                 st.rerun()
         else:
+            st.text_area("Your answer:", value=res.get("response", ""), key=f"t_{wid}_done", height=140,
+                         disabled=True)
             show_written_feedback(res, pack)
 
     if res is not None and i < 2 and i == cur["q"]:
@@ -1208,21 +1508,24 @@ def render_summary(cur, prog):
             st.caption(f"Reading check: {n} of {N_DIAG} done. The next passage is about "
                        f"{LEVELS[DIAGNOSTIC_PLAN[n]['level']]} words.")
         else:
-            st.success("🎉 Reading check finished! From now on, every passage is chosen just for you — "
-                       "practise as many as you like. 😄")
+            st.success(f"🎉 Reading check finished! Practice starts with {LEVELS[PRACTICE_MIN]}-word passages and "
+                       f"climbs to {', '.join(str(w) for w in LEVELS[PRACTICE_MIN + 1:])} words — each step a little "
+                       "harder. Score 80% or more to move up. Practise as many as you like! 😄")
     else:
         nxt, lvl = cur["next_level"], cur["level_idx"]
         if nxt > lvl:
             st.success(f"⬆️ Level up! 🥳 Next passage: {LEVELS[nxt]} words ({LEVEL_NAMES[nxt]}).")
         elif nxt < lvl:
-            st.warning(f"Let's build strength with a shorter passage next: {LEVELS[nxt]} words. You've got this! 💪")
+            st.warning(f"Let's build strength with a shorter, easier passage next: {LEVELS[nxt]} words. "
+                       "You've got this! 💪")
         else:
             st.info(f"Same level next time ({LEVELS[nxt]} words) — score 80% or more to level up. 🚀")
 
     a, b2, c = st.columns(3)
     if a.button("Next passage 📖", type="primary"):
         st.session_state.current = None
-        st.session_state.progress = load_progress(st.session_state.roll)
+        st.session_state.progress = compute_progress()  # from memory — no waiting for Google Sheets
+        prefetch(st.session_state.progress)
         st.rerun()
     if b2.button("🔁 Try this passage again"):
         st.session_state.current = retry_passage(cur)
@@ -1268,7 +1571,8 @@ def twin_welcome(prog):
     name = first_name()
     if prog["n_done"] == 0:
         msg = (f"Hi {name}! 👋 I'm <b>Twin</b>, your English language twin. We'll start with a short reading "
-               f"check — two popular-science articles — so I can learn how you read and think. "
+               f"check — two very short popular-science articles (about 50 words each) — so I can learn how you read "
+               f"and think. After that, practice starts at 60 words and grows to 70, 80 and 100 words. "
                f"There are no trick questions, only thinking questions. Ready? 😊")
     else:
         strongest = max((k for k in SKILLS if prog["skills"][k] is not None and not pd.isna(prog["skills"][k])),
@@ -1309,8 +1613,11 @@ def student_page():
                        "press the button below.")
             st.button("🔄 Try again")
             st.stop()
-        draft = pending_draft(st.session_state.roll)
+        draft = pending_draft(st.session_state.roll, st.session_state.progress["done_ids"])
         st.session_state.draft = draft
+        if draft:
+            st.session_state.setdefault("served", set()).add(draft["pack"]["title"])
+        prefetch(st.session_state.progress)  # start writing the first passage while the student reads the welcome
     prog = st.session_state.progress
     student_sidebar(prog)
     st.title(f"🔬 {APP_NAME}")
@@ -1342,22 +1649,23 @@ def student_page():
         if prog["phase"] == "Diagnostic":
             st.markdown(f"**Reading check {prog['diag_done'] + 1} of {N_DIAG}** — about **{words} words**.")
         else:
-            st.markdown(f"**Next practice passage:** about **{words} words** · focus: "
-                        f"**{SKILLS[prog['focus']].lower()}** · practise as many as you like!")
+            st.markdown(f"**Next practice passage:** about **{words} words** ({LEVEL_NAMES[prog['level_idx']]}, "
+                        f"step {prog['level_idx']} of {PRACTICE_MAX}) · focus: **{SKILLS[prog['focus']].lower()}** · "
+                        "practise as many as you like!")
         if st.button("Get my passage 📖", type="primary"):
-            with st.spinner(f"{TWIN} Twin is writing a passage just for you..."):
+            with st.spinner(f"{TWIN} Twin is getting your passage..."):
                 try:
                     st.session_state.current = new_passage(prog)
                 except Exception as e:
                     st.error(str(e) if isinstance(e, RuntimeError) else friendly(e))
                     return
             save_draft(st.session_state.current)
+            prefetch(prog, after_serving=True)  # get the NEXT passage ready while this one is read
             st.rerun()
         return
 
     pack = cur["pack"]
     retry = f" · attempt {cur['attempt']}" if cur.get("attempt", 1) > 1 else ""
-    retry += " · 📦 from the passage bank" if cur.get("source") == "bank" else ""
     st.caption(f"{cur['phase']} · {cur['topic']} · {wc(pack['passage'])} words{retry}")
     st.subheader(md(pack["title"]))
 
@@ -1400,8 +1708,13 @@ def teacher_page():
         st.rerun()
     if TEACHER_PASSWORD == "admin123":
         st.warning("You're using the default teacher password. Set TEACHER_PASSWORD in secrets.")
+    w = get_writer()
+    if w.pending():
+        st.caption(f"💾 {w.pending()} row(s) waiting to be saved to the Sheet (saved in the background every few "
+                   "seconds)." + (f" Last problem: {w.last_error}" if w.failures else ""))
     if st.button("🔄 Refresh data"):
         clear_cache()
+        get_bank.clear()
         st.rerun()
 
     ROSTER = get_roster()
@@ -1430,7 +1743,12 @@ def teacher_page():
         prac = p[p["phase"] == "Practice"]
         recent = p.tail(6)
         skill_avg = {SKILLS[k]: recent[k].mean() for k in SKILLS}
-        level = LEVELS[int(prac.iloc[-1]["next_level_idx"])] if not prac.empty else None
+        ladder = prac[prac["passage_id"].astype(str).str.startswith(VERSION_TAG)]
+        if not ladder.empty:
+            nl = int(num(ladder.iloc[-1]["next_level_idx"], PRACTICE_MIN))
+            level = LEVELS[min(max(nl, PRACTICE_MIN), PRACTICE_MAX)]
+        else:
+            level = LEVELS[PRACTICE_MIN] if diag >= N_DIAG else None
         rows.append({
             **base,
             "Status": "Practice" if diag >= N_DIAG else f"Reading check {diag}/{N_DIAG}",
@@ -1490,40 +1808,51 @@ def teacher_page():
                          hide_index=True)
 
     st.subheader("📦 Passage bank")
-    bank = read_table("Bank")
+    bank_store = get_bank()
+    bank_store.ensure_loaded()
+    bank = pd.DataFrame(bank_store.all(), columns=BANK_COLS)
     if bank.empty:
         st.caption("The bank is empty. Every new passage is saved here automatically.")
     else:
-        counts = bank["words"].map(lambda w: f"{w} words").value_counts().reindex(
-            [f"{w} words" for w in LEVELS], fill_value=0)
-        checked = int((bank["fact_check"] == "pass").sum())
-        st.caption(f"{len(bank)} passages saved, {checked} fact-checked. When Gemini is at its limit, students get a "
-                   "fact-checked one they have never done (reported passages are skipped).")
-        st.bar_chart(counts.rename("Passages"))
-    st.markdown("Stock up the bank at a quiet time (e.g. the evening before class). Each passage uses about two "
-                "Gemini requests (writing + fact-check). Only fact-checked passages are reused.")
+        checked = bank[bank["fact_check"] == "pass"]
+        counts = checked.apply(lambda r: f"{'Reading check ' + str(int(num(r['stage'])) + 1) if r['phase'] == 'Diagnostic' else 'Practice'}"
+                                         f" · {r['words']} words", axis=1).value_counts().sort_index()
+        st.caption(f"{len(bank)} passages for the 50 / 60 / 70 / 80 / 100-word ladder, {len(checked)} fact-checked "
+                   "and ready. Students get these instantly; new ones are written in the background while they "
+                   "read. Reported passages are never reused.")
+        st.bar_chart(counts.rename("Ready passages"))
+    jobs = get_jobs()
+    if jobs["fill_left"][0] > 0:
+        st.info(f"⏳ Filling the bank in the background: {jobs['fill_left'][0]} passage(s) still to write. "
+                "You can leave this page; click 🔄 Refresh data later to see them.")
+    st.markdown("Stock up the bank at a quiet time (e.g. the evening before class) so every student gets their "
+                "passage instantly. Each passage uses about two Gemini requests (writing + fact-check). Only "
+                "fact-checked passages are reused.")
     n = st.number_input("How many passages to add?", min_value=1, max_value=60, value=12, step=6)
-    if st.button("➕ Fill the passage bank"):
-        bar, added = st.progress(0.0, text="Starting..."), 0
-        for i in range(int(n)):
-            if i % 4 < N_DIAG:  # about half diagnostic passages, half practice passages
-                stage = i % 4
-                phase, level, topic = "Diagnostic", DIAGNOSTIC_PLAN[stage]["level"], DIAGNOSTIC_PLAN[stage]
-            else:
-                phase, stage, level = "Practice", 0, random.randrange(len(LEVELS))
-                topic = random.choice(PRACTICE_TOPICS)
+    if st.button("➕ Fill the passage bank (runs in the background)"):
+        # Even mix: reading check 1, reading check 2, then 60, 70, 80, 100 words.
+        plan = [("Diagnostic", 0), ("Diagnostic", 1)] + [("Practice", lvl) for lvl in range(PRACTICE_MIN, PRACTICE_MAX + 1)]
+        ctx, writer, titles = gemini_ctx(), get_writer(), [r["title"] for r in bank_store.all()]
+
+        def fill_one(phase, x):
             try:
-                titles = read_table("Bank")["title"].tolist()
-                pack, status = generate_pack(level, topic, None, titles, "")
-            except Exception as e:
-                st.warning(f"Stopped after {added} passage(s) — Gemini needs a rest. Try again in a few minutes. ({e})")
-                break
-            save_to_bank(pack, phase, stage, level, topic["label"], None, status)
-            added += 1
-            bar.progress((i + 1) / n, text=f"Added {added} of {int(n)} — {LEVELS[level]} words: {pack['title']}")
-            time.sleep(4)  # stay under the free per-minute limit
-        else:
-            st.success(f"Done! {added} passages added. The bank now has {len(read_table('Bank'))} passages. 🎉")
+                if phase == "Diagnostic":
+                    topic, stage, level = DIAGNOSTIC_PLAN[x], x, DIAGNOSTIC_PLAN[x]["level"]
+                else:
+                    topic, stage, level = random.choice(PRACTICE_TOPICS), 0, x
+                pack, status = generate_pack(level, topic, None, titles[-12:], "", ctx=ctx)
+                titles.append(pack["title"])
+                save_to_bank(bank_row(pack, phase, stage, level, topic["label"], None, status), bank_store, writer)
+                time.sleep(4)  # stay under the free per-minute limit
+            except Exception:
+                time.sleep(30)  # Gemini needs a rest
+            finally:
+                jobs["fill_left"][0] = max(jobs["fill_left"][0] - 1, 0)
+
+        for i in range(int(n)):
+            jobs["fill_left"][0] += 1
+            jobs["teacher"].submit(fill_one, *plan[i % len(plan)])
+        st.success(f"Started! {int(n)} passage(s) are being written in the background. 🎉")
 
     flags = read_table("Flags")
     st.subheader(f"🚩 Reported passages ({len(flags)})")
